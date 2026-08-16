@@ -5,6 +5,7 @@ from __future__ import annotations
 import streamlit as st
 
 from config import get_settings
+from Demo import STEP_METHODS, InstrumentedLLMService
 from llm_service import LLMError, LLMService
 from logging_config import setup_logging
 from orchestrator import Orchestrator
@@ -60,6 +61,21 @@ if saved:
 else:
     st.sidebar.caption("No saved runs yet.")
 
+st.sidebar.divider()
+
+# --- Sidebar: fault injection for demonstrating recovery --------------------
+with st.sidebar.expander("🧪 Resilience demo"):
+    st.caption(
+        "Force a stage to fail, then re-run with the same workflow ID. "
+        "The completed stages are reloaded from disk instead of recomputed."
+    )
+    crash_choice = st.selectbox(
+        "Simulate a crash at",
+        ["No crash", *[s.value for s in StepName]],
+        help="Injects a failure at the chosen stage. Earlier stages still persist.",
+    )
+crash_stage = next((s for s in StepName if s.value == crash_choice), None)
+
 # --- Input ------------------------------------------------------------------
 loaded = store.load(selected) if selected else None
 
@@ -75,6 +91,25 @@ with st.form("workflow_form"):
     )
     submitted = st.form_submit_button("▶️ Run workflow", type="primary", use_container_width=True)
 
+def execute(wid: str, brief: str, retries: int, fail_at: StepName | None) -> None:
+    """Run or resume a workflow, recording how many model calls it took."""
+    validate_workflow_id(wid)
+    llm = InstrumentedLLMService(LLMService(settings=settings), fail_at=fail_at)
+
+    with st.spinner("Running the workflow..."):
+        state = Orchestrator(llm, store).run_workflow(prompt=brief, workflow_id=wid)
+        if state.max_qa_retries != retries:
+            state.max_qa_retries = int(retries)
+            store.save(state)
+
+    st.session_state["last_run"] = {
+        "calls": llm.total_calls,
+        "stages": dict(llm.call_counts),
+        "resumed": bool(st.session_state.get("has_run_before", {}).get(wid)),
+    }
+    st.session_state.setdefault("has_run_before", {})[wid] = True
+
+
 if submitted:
     if not settings.is_configured:
         st.error("Enter a Groq API key in the sidebar first.")
@@ -82,19 +117,11 @@ if submitted:
         st.error("Enter a campaign brief.")
     else:
         try:
-            validate_workflow_id(workflow_id)
             existing = store.load(workflow_id)
             if existing and existing.status is WorkflowStatus.COMPLETED:
                 st.info("This run already completed. Change the ID to start a fresh one.")
             else:
-                with st.spinner("Running the workflow..."):
-                    orchestrator = Orchestrator(
-                        llm_service=LLMService(settings=settings), state_store=store
-                    )
-                    state = orchestrator.run_workflow(prompt=prompt, workflow_id=workflow_id)
-                    if state.max_qa_retries != max_retries:
-                        state.max_qa_retries = int(max_retries)
-                        store.save(state)
+                execute(workflow_id, prompt, max_retries, crash_stage)
                 st.rerun()
         except InvalidWorkflowId as exc:
             st.error(str(exc))
@@ -112,7 +139,32 @@ icon, level = STATUS_STYLE.get(state.status, ("•", "info"))
 getattr(st, level)(f"{icon} **{state.status.value}** — workflow `{state.workflow_id}`")
 
 if state.error_message:
-    st.error(f"{state.error_message}\n\nRe-run with the same ID to resume from this stage.")
+    done = len(state.completed_steps())
+    st.error(
+        f"{state.error_message}\n\n"
+        f"{done} of {len(StepName)} stages are saved to disk. "
+        "Resuming continues from the stage that failed."
+    )
+    if st.button("⏭️ Resume from where it stopped", type="primary", use_container_width=True):
+        try:
+            execute(state.workflow_id, state.original_prompt, state.max_qa_retries, crash_stage)
+            st.rerun()
+        except LLMError as exc:
+            st.error(f"The model could not complete the request: {exc}")
+
+# Evidence that resuming skipped the finished work
+last = st.session_state.get("last_run")
+if last:
+    skipped = [
+        s.value.split(": ", 1)[-1]
+        for s in StepName
+        if STEP_METHODS[s] not in last["stages"] and state.is_step_completed(s)
+    ]
+    col_a, col_b = st.columns(2)
+    col_a.metric("Model calls in the last run", last["calls"])
+    col_b.metric("Stages reloaded from disk", len(skipped))
+    if skipped:
+        st.caption("Reused without recomputing: " + ", ".join(skipped))
 
 # Stage progress
 st.markdown("#### Pipeline")
