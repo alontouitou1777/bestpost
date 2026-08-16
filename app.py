@@ -5,7 +5,7 @@ from __future__ import annotations
 import streamlit as st
 
 from config import get_settings
-from Demo import STEP_METHODS, InstrumentedLLMService
+from demo import STEP_METHODS, InstrumentedLLMService
 from llm_service import LLMError, LLMService
 from logging_config import setup_logging
 from orchestrator import Orchestrator
