@@ -217,10 +217,17 @@ Return JSON with exactly these keys:
     def generate_final_package(
         self, brief: StrategicBrief, angle: AngleOption | None, draft: DraftOption
     ) -> str:
-        """Assemble the approved work into a deliverable summary."""
+        """Assemble the approved work into a deliverable summary.
+
+        This is the one stage that asks for prose rather than structured data,
+        so it skips JSON mode entirely. Wrapping a multi-paragraph Markdown
+        document inside a JSON string field is needlessly fragile: any stray
+        quote or newline from the model breaks the parse.
+        """
         angle_name = angle.style_name if angle else "n/a"
-        data = self.generate_json(
-            prompt=f"""Assemble a short campaign handover document in Markdown.
+        package = self._complete_text(
+            system="You are a campaign producer preparing a handover document.",
+            prompt=f"""Write a short campaign handover document in Markdown.
 
 Product: {brief.product}
 Audience: {brief.target_audience}
@@ -229,17 +236,39 @@ Headline: {draft.headline}
 Body: {draft.body}
 Call to action: {draft.call_to_action}
 
-Include: a one-line summary, the approved copy, and three suggested visual
-directions for the creative team.
-
-Return JSON with exactly this key:
-{{"final_package": "the full markdown document"}}""",
-            system_prompt="You are a campaign producer preparing a handover.",
+Include a one-line summary, the approved copy, and three suggested visual
+directions for the creative team. Reply with the document only, no preamble.""",
         )
-        package = data.get("final_package")
-        if not isinstance(package, str) or not package.strip():
-            raise LLMError("Final package response did not contain usable content.")
+        if not package.strip():
+            raise LLMError("Final package response was empty.")
         return package
+
+    def _complete_text(self, system: str, prompt: str) -> str:
+        """Request free-form text, retrying on transport errors."""
+        attempts = max(1, self.settings.llm_max_retries)
+        last_error: Exception | None = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=self.settings.llm_temperature,
+                )
+                content = response.choices[0].message.content
+                if content and content.strip():
+                    return content
+                raise LLMError("Model returned an empty response.")
+            except Exception as exc:  # noqa: BLE001 - re-raised as LLMError below
+                last_error = exc
+                logger.warning("Text attempt %d/%d failed: %s", attempt, attempts, exc)
+                if attempt < attempts:
+                    time.sleep(2 ** (attempt - 1))
+
+        raise LLMError(f"Could not generate the final package: {last_error}") from last_error
 
     # -- Plumbing -----------------------------------------------------------
     def generate_json(self, prompt: str, system_prompt: str = "You are an AI assistant.") -> dict:
